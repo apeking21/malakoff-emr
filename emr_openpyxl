@@ -1,0 +1,397 @@
+import os
+import sys
+from pathlib import Path
+from datetime import datetime
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment
+from openpyxl.utils import get_column_letter
+from openpyxl.workbook.defined_name import DefinedName
+
+# ---------------- Configuration ----------------
+START_ROW = 6  # copy from row 6 downward
+
+# Pad with leading zeros: { sheet: { col-letter-or-1based-index: total_length } }
+PAD_WITH_LEADING_ZEROS = {
+    # "Documents": {"B": 2},
+}
+
+# Percent columns: { sheet: [col-letter-or-1based-index, ...] }
+# Interprets source values like 15 -> 0.15 written with % number format
+PERCENT_COLUMNS = {
+    "LineItemsTaxes": ["E"],
+    "LineItemsDiscounts": ["D"],
+    "LineItemsCharges": ["D"],
+}
+
+# Decimal precision: { sheet: { col-letter-or-1based-index: dp } }
+DECIMAL_PRECISION_COLUMNS = {
+    "Documents": {"AM": 5, "AN": 5, "AO": 5, "AP": 5, "AQ": 5, "AR": 5, "AS": 5, "AT": 5},
+}
+
+# Named ranges to extend after paste: list of tuples
+# (sheet_name, range_name, col_letter, start_row)
+NAMED_RANGES_TO_EXTEND = [
+    ("Documents", "InvoiceNumbersList", "B", 5),
+    ("DocumentLineItems", "InvoiceItemsList", "C", 5),
+]
+
+# Number formats
+FMT_TEXT = "@"
+FMT_INT = "0"
+FMT_FLOAT_WIDE = "0"
+# For percent, we’ll use "0%" unless you want a fixed dp like "0.00000%"
+
+
+# ---------------- Helpers ----------------
+def col_to_index(c, max_col):
+    """Accepts letter ('B') or 1-based index (2); returns 1-based index."""
+    if isinstance(c, str):
+        c = c.strip().upper()
+        # convert letters to index
+        val, mul = 0, 1
+        for ch in reversed(c):
+            if not ('A' <= ch <= 'Z'):
+                raise ValueError(f"Invalid column spec {c}")
+            val += (ord(ch) - 64) * mul
+            mul *= 26
+        idx = val
+    else:
+        idx = int(c)
+    if idx < 1:
+        raise ValueError("Column index must be >= 1")
+    # don’t clamp to max_col; caller can check if needed
+    return idx
+
+def cols_set_for_sheet(mapping, sheet_name, max_col):
+    """Returns a 0-based set of column indices for a given sheet from a dict mapping."""
+    out = set()
+    spec = mapping.get(sheet_name, {})
+    if isinstance(spec, dict):
+        iterable = spec.keys()
+    else:
+        iterable = spec
+    for item in iterable:
+        try:
+            j1 = col_to_index(item, max_col)
+            out.add(j1 - 1)
+        except Exception:
+            pass
+    return out
+
+def cols_map_for_sheet(mapping, sheet_name, max_col):
+    """Returns a dict of {0-based-index: value} for a given sheet from a dict mapping."""
+    out = {}
+    spec = mapping.get(sheet_name, {})
+    if not isinstance(spec, dict):
+        return out
+    for k, v in spec.items():
+        try:
+            j1 = col_to_index(k, max_col)
+            out[j1 - 1] = v
+        except Exception:
+            pass
+    return out
+
+def extend_named_range_to_col(wb, sheet_name, range_name, col_letter, start_row):
+    """Extend workbook-scoped defined name to the last non-empty row in given column."""
+    if sheet_name not in wb.sheetnames:
+        return
+    ws = wb[sheet_name]
+    # find last used row in column
+    last = ws.max_row
+    # Walk up from bottom to find first non-empty
+    last_row = start_row
+    for r in range(last, start_row - 1, -1):
+        if ws[f"{col_letter}{r}"].value not in (None, ""):
+            last_row = r
+            break
+    refers_to = f"='{sheet_name}'!${col_letter}${start_row}:${col_letter}${last_row}"
+
+    # Prefer workbook-scoped name
+    dn = wb.defined_names.get(range_name)
+    if dn is None:
+        # create new workbook-scoped name
+        wb.defined_names.append(DefinedName(name=range_name, attr_text=refers_to))
+        return
+
+    # If multiple entries (local names), replace workbook-scoped if present else append
+    entries = dn.destinations if hasattr(dn, 'destinations') else None
+    # Easiest: replace the defined name entirely with workbook-scoped one
+    # (Excel will merge fine)
+    # First remove existing dn
+    try:
+        del wb.defined_names[range_name]
+    except Exception:
+        pass
+    wb.defined_names.append(DefinedName(name=range_name, attr_text=refers_to))
+
+def number_format_for_precision(dp):
+    if dp is None:
+        return None
+    if dp <= 0:
+        return FMT_INT
+    return "0." + ("0" * dp)
+
+def write_sheet_values(src_ws, dst_ws, sheet_name):
+    # Determine bounds from source
+    max_row = src_ws.max_row
+    max_col = src_ws.max_column
+    if max_row < START_ROW:
+        return 0, 0
+
+    # Build column category maps
+    pad_map = cols_map_for_sheet(PAD_WITH_LEADING_ZEROS, sheet_name, max_col)     # {j0: total_len}
+    percent_set = cols_set_for_sheet(PERCENT_COLUMNS, sheet_name, max_col)        # {j0}
+    prec_map = cols_map_for_sheet(DECIMAL_PRECISION_COLUMNS, sheet_name, max_col) # {j0: dp}
+
+    # Optional: clear any existing rows below start (not strictly needed)
+    # No clear here to preserve validations/formatting; we'll overwrite cells we touch.
+
+    write_rows = max_row - START_ROW + 1
+
+    # Pre-set number formats by column where appropriate
+    for j0 in range(max_col):
+        col_letter = get_column_letter(j0 + 1)
+        rng = dst_ws[f"{col_letter}{START_ROW}:{col_letter}{START_ROW + write_rows - 1}"]
+
+        cells_to_format = [row[0] for row in rng] # Extract the single cell from each row-tuple
+        
+        if j0 in percent_set:
+            # Let’s use numeric percent (0.xx) with "0%" (or more dp if you want)
+            fmt = "0%"  # change to "0.00000%" if fixed dp needed
+            for cell in cells_to_format:
+                cell.number_format = fmt
+        elif j0 in pad_map:
+            for cell in cells_to_format:
+                cell.number_format = FMT_TEXT
+        elif j0 in prec_map:
+            fmt = number_format_for_precision(prec_map[j0]) or FMT_FLOAT_WIDE
+            for cell in cells_to_format:
+                cell.number_format = fmt
+        else:
+            # Generic: avoid scientific notation; if integers likely -> "0"; else general float format
+            # We cannot perfectly inspect; set wide float to be safe
+            for cell in cells_to_format:
+                cell.number_format = FMT_FLOAT_WIDE
+
+        # Keep alignment from row 5 if you want (horizontal/vertical/wrap)
+        try:
+            src_align = dst_ws[f"{col_letter}5"].alignment
+            align = Alignment(horizontal=src_align.horizontal,
+                              vertical=src_align.vertical,
+                              wrap_text=src_align.wrap_text,
+                              indent=src_align.indent)
+            for cell in rng:
+                cell.alignment = align
+        except Exception:
+            pass
+
+    # Now write values
+    for i in range(write_rows):
+        dst_row = START_ROW + i
+        for j0 in range(max_col):
+            src_cell = src_ws.cell(row=START_ROW + i, column=j0 + 1)
+            dst_cell = dst_ws.cell(row=dst_row, column=j0 + 1)
+            v = src_cell.value
+
+            # Percent columns: assume source has e.g. 15 -> we write 0.15
+            if j0 in percent_set:
+                if v in (None, ""):
+                    dst_cell.value = None
+                else:
+                    try:
+                        num = float(v)
+                        dst_cell.value = num / 100.0
+                    except Exception:
+                        # fallback: if already like "12%" string, try to parse
+                        s = str(v).strip()
+                        if s.endswith("%"):
+                            try:
+                                dst_cell.value = float(s[:-1]) / 100.0
+                            except Exception:
+                                dst_cell.value = v
+                        else:
+                            dst_cell.value = v
+                continue
+
+            # Padding columns: force text and pad
+            if j0 in pad_map:
+                total_len = int(pad_map[j0])
+                s = "" if v is None else str(v)
+                # strip spaces but DO NOT drop zeros
+                s = s.strip()
+                if total_len > 0 and len(s) < total_len:
+                    s = s.zfill(total_len)
+                dst_cell.value = s
+                continue
+
+            # Precision columns: round to dp (still numeric)
+            if j0 in prec_map:
+                dp = int(prec_map[j0])
+                if v in (None, ""):
+                    dst_cell.value = None
+                else:
+                    try:
+                        dst_cell.value = round(float(v), dp)
+                    except Exception:
+                        dst_cell.value = v
+                continue
+
+            # Default: write as-is (numbers remain numbers; strings remain strings)
+            dst_cell.value = v
+
+    return write_rows, max_col
+
+def harden_workbook_calc(wb):
+    """
+    Nudge calc flags so portals re-evaluate:
+      - set fullCalcOnLoad
+      - set calcMode to auto
+    """
+    try:
+        cp = wb.calculation_properties
+    except Exception:
+        cp = None
+    if cp:
+        cp.fullCalcOnLoad = True
+        cp.calcMode = "auto"
+
+def process(template_path, source_path, output_dir):
+    template_path = Path(template_path)
+    source_path = Path(source_path)
+
+    # Load both with data_only=False to preserve formulas/validations in template
+    wb_template = load_workbook(template_path, data_only=False, keep_vba=False)
+    wb_source = load_workbook(source_path, data_only=True)
+
+    src_names = set(wb_source.sheetnames)
+    dst_names = set(wb_template.sheetnames)
+    common = sorted(src_names & dst_names)
+
+    for name in common:
+        write_sheet_values(wb_source[name], wb_template[name], name)
+
+    # Extend named ranges
+    for sheet_name, range_name, col_letter, start_r in NAMED_RANGES_TO_EXTEND:
+        try:
+            extend_named_range_to_col(wb_template, sheet_name, range_name, col_letter, start_r)
+        except Exception:
+            pass
+
+    # Harden calc
+    harden_workbook_calc(wb_template)
+
+    # Output filename USER_HHMM_DDMMYYYY.xlsx (portal-friendly)
+    user = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M")
+    out_name = f"{user}_{ts}.xlsx"
+    out_path = Path(output_dir) / out_name
+
+    wb_template.save(out_path)
+    return str(out_path)
+
+# ---------------- Tiny Tk UI ----------------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Excel Merge (openpyxl)")
+        self.geometry("620x250")
+        self.minsize(620, 250)
+        self.resizable(True, False)
+
+        self.template = tk.StringVar()
+        self.source = tk.StringVar()
+        self.output = tk.StringVar()
+
+        self.ok_t = tk.BooleanVar(master=self, value=False)
+        self.ok_s = tk.BooleanVar(master=self, value=False)
+        self.ok_o = tk.BooleanVar(master=self, value=False)
+
+        self._build()
+
+    def _build(self):
+        pad = 10
+        tk.Label(self, text="Select Template, Source, Output Folder, then Run").pack(pady=(12,6))
+
+        frm = tk.Frame(self); frm.pack(fill="x", expand=True, padx=pad, pady=(0,8))
+
+        self._row(frm, 0, "Select TEMPLATE workbook", self.template, self.ok_t, self.pick_t)
+        self._row(frm, 1, "Select SOURCE workbook", self.source, self.ok_s, self.pick_s)
+        self._row(frm, 2, "Select OUTPUT folder",   self.output, self.ok_o, self.pick_o)
+
+        btns = tk.Frame(self); btns.pack(pady=(8,6))
+        self.run_btn = tk.Button(btns, text="Run", width=18, state="disabled", command=self.on_run)
+        self.run_btn.pack(side="left", padx=8)
+        self.open_btn = tk.Button(btns, text="Open folder", width=18, state="disabled", command=self.on_open)
+        self.open_btn.pack(side="left", padx=8)
+
+        self.status = tk.Label(self, text="", fg="gray", wraplength=580, justify="center")
+        self.status.pack(pady=(2,6))
+
+        self.after(200, self._update_state)
+
+    def _row(self, parent, row, text, var_path, var_ok, cmd):
+        tk.Button(parent, text=text, width=28, command=cmd).grid(row=row, column=0, padx=(0,8), pady=6, sticky="w")
+        tick = tk.Label(parent, text="✗", fg="red", width=2, anchor="w")
+        tick.grid(row=row, column=1, sticky="w")
+        var_ok.trace_add("write", lambda *_: tick.config(text="✓" if var_ok.get() else "✗",
+                                                         fg="green" if var_ok.get() else "red"))
+        tk.Entry(parent, textvariable=var_path, state="readonly").grid(row=row, column=2, padx=(8,0), sticky="we")
+        parent.grid_columnconfigure(2, weight=1)
+
+    def pick_t(self):
+        p = filedialog.askopenfilename(title="Template workbook", filetypes=[("Excel","*.xlsx")])
+        if p:
+            self.template.set(p); self.ok_t.set(True)
+        self._update_state()
+
+    def pick_s(self):
+        p = filedialog.askopenfilename(title="Source workbook", filetypes=[("Excel","*.xlsx")])
+        if p:
+            self.source.set(p); self.ok_s.set(True)
+        self._update_state()
+
+    def pick_o(self):
+        p = filedialog.askdirectory(title="Output folder")
+        if p:
+            self.output.set(p); self.ok_o.set(True)
+        self._update_state()
+
+    def _update_state(self):
+        ready = self.ok_t.get() and self.ok_s.get() and self.ok_o.get()
+        self.run_btn.config(state="normal" if ready else "disabled")
+
+    def on_run(self):
+        self.run_btn.config(state="disabled")
+        self.open_btn.config(state="disabled")
+        self.status.config(text="Running...", fg="gray")
+        self.update_idletasks()
+        try:
+            out = process(self.template.get(), self.source.get(), self.output.get())
+            self._last_out_dir = self.output.get()
+            self.status.config(text=f"Done: {out}", fg="green")
+            self.open_btn.config(state="normal")
+        except Exception as e:
+            self.status.config(text=f"Error: {e}", fg="red")
+        finally:
+            self._update_state()
+
+    def on_open(self):
+        d = getattr(self, "_last_out_dir", self.output.get())
+        if not d:
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(d)
+            elif sys.platform == "darwin":
+                import subprocess; subprocess.Popen(["open", d])
+            else:
+                import subprocess; subprocess.Popen(["xdg-open", d])
+        except Exception as e:
+            messagebox.showwarning("Open folder", f"Failed: {e}")
+
+if __name__ == "__main__":
+    App().mainloop()
