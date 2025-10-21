@@ -66,7 +66,7 @@ def run_process(template_path, source_path, output_dir, runner_path):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Hybrid Excel Merge Runner v4.0")
+        self.title("Hybrid Excel Merge Runner v4.2")
         self.geometry("620x250")
         self.minsize(620, 250)
         self.resizable(True, False)
